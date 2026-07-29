@@ -1,0 +1,173 @@
+name: 'Release Luau Package Action'
+description: 'Publish a Luau package on npm and create a GitHub release with attached assets'
+
+inputs:
+  artifacts:
+    description: 'JSON array of objects with keys name, path, and content-type'
+    required: true
+    default: '[]'
+  release-tag:
+    description: 'The version to release starting with `v`'
+    default: ''
+    required: false
+  package-manager:
+    description: 'Package manager to use [defaults to yarn]. Options: yarn, npm'
+    required: false
+    default: 'yarn'
+  working-directory:
+    description: 'The working directory to use for the action'
+    required: false
+    default: '.'
+  release-ref:
+    description: 'The branch, tag or SHA to checkout (empty uses the default ref)'
+    default: ''
+  github-token:
+    description: 'GitHub token for authentication'
+    default: ${{ github.token }}
+
+branding:
+  icon: 'package'
+  color: 'orange'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+      with:
+        ref: ${{ inputs.release-ref != '' && inputs.release-ref || github.ref }}
+
+    - name: Test and prepare package
+      uses: seaofvoices/test-luau-package-action@v1
+      with:
+        package-manager: ${{ inputs.package-manager }}
+        working-directory: ${{ inputs.working-directory }}
+        skip-checkout: 'true'
+        skip-lint: 'true'
+        skip-format: 'true'
+
+    - name: Read package version
+      uses: seaofvoices/read-data-field-action@v1
+      id: read-package-version
+      with:
+        file: ${{ (inputs.working-directory != '' && inputs.working-directory != '.') && format('{0}/', inputs.working-directory) || '' }}package.json
+        field: version
+
+    - name: Publish to npm registry
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "publishing to npm registry with ${{ inputs.package-manager }}"
+        if [ "${{ inputs.package-manager }}" = "npm" ]; then
+          npm publish --provenance --access public
+        else
+          yarn npm publish --provenance --access public
+        fi
+
+    - name: Define release tag
+      id: setup_release_tag
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.release-tag }}" ]; then
+          echo 'use_tag="v${{ steps.read-package-version.outputs.version }}"' >> $GITHUB_OUTPUT
+        else
+          echo 'use_tag="${{ inputs.release-tag }}"' >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create tag
+      shell: bash
+      run: |
+        echo "Use release tag: ${{ steps.setup_release_tag.outputs.use_tag }}"
+        git fetch --tags --no-recurse-submodules
+        if [ ! "$(git tag -l ${{ steps.setup_release_tag.outputs.use_tag }}" ]; then
+          git tag ${{ steps.setup_release_tag.outputs.use_tag }}
+          git push origin ${{ steps.setup_release_tag.outputs.use_tag }}
+        fi
+
+    - name: Create release
+      id: create_release
+      uses: softprops/action-gh-release@v3
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      with:
+        tag_name: ${{ steps.setup_release_tag.outputs.use_tag }}
+        name: ${{ steps.setup_release_tag.outputs.use_tag }}
+        draft: false
+
+    - name: Upload release assets
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        UPLOAD_URL: ${{ steps.create_release.outputs.upload_url }}
+        ARTIFACTS_JSON: ${{ inputs.artifacts }}
+      run: |
+        set -euo pipefail
+        node <<'NODE'
+        const fs = require('fs');
+        const path = require('path');
+        const { spawnSync } = require('child_process');
+
+        const raw = process.env.ARTIFACTS_JSON || '[]';
+        let artifacts;
+        try {
+          artifacts = JSON.parse(raw);
+        } catch (e) {
+          console.error('artifacts input must be valid JSON:', e.message);
+          process.exit(1);
+        }
+        if (!Array.isArray(artifacts) || artifacts.length === 0) {
+          console.error('artifacts input must be a non-empty JSON array');
+          process.exit(1);
+        }
+
+        const uploadUrl = process.env.UPLOAD_URL || '';
+        const base = uploadUrl.split('{')[0];
+
+        const errors = [];
+
+        artifacts.forEach(({ name: assetName, path: artifactPath, "content-type": contentType }) => {
+          if (!assetName || !artifactPath || !contentType) {
+            errors.push('each artifact requires name, path, and content-type');
+            return
+          }
+          const filePath = path.join(process.cwd(), artifactPath);
+
+          if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+            errors.push(`missing asset file at ${filePath}`);
+          }
+          const url = `${base}?name=${encodeURIComponent(assetName)}`;
+
+          console.log(`uploading asset ${assetName} to ${url}`);
+
+          const r = spawnSync(
+            'gh',
+            [
+              'api',
+              '--method',
+              'POST',
+              '-H',
+              'Accept: application/vnd.github+json',
+              '-H',
+              `Content-Type: ${contentType}`,
+              url,
+              '--input',
+              filePath,
+            ],
+            { stdio: 'inherit', env: process.env },
+          );
+          if (r.error) {
+            errors.push(`error: ${r.error}`);
+          } else if (r.status !== 0) {
+            errors.push(`failed to upload asset ${assetName} to ${url}: ${r.status}`);
+          } else {
+            console.log(`successfully uploaded asset ${assetName}`);
+          }
+        })
+
+        if (errors.length > 0) {
+          console.error('errors:\n' + errors.join('\n'));
+          process.exit(1);
+        }
+
+        NODE
