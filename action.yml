@@ -69,7 +69,7 @@ runs:
       shell: bash
       run: |
         if [ -z "${{ inputs.release-tag }}" ]; then
-          echo 'use_tag="v${{ steps.read-package-version.outputs.version }}"' >> $GITHUB_OUTPUT
+          echo 'use_tag="v${{ steps.read-package-version.outputs.result }}"' >> $GITHUB_OUTPUT
         else
           echo 'use_tag="${{ inputs.release-tag }}"' >> $GITHUB_OUTPUT
         fi
@@ -79,7 +79,7 @@ runs:
       run: |
         echo "Use release tag: ${{ steps.setup_release_tag.outputs.use_tag }}"
         git fetch --tags --no-recurse-submodules
-        if [ ! "$(git tag -l ${{ steps.setup_release_tag.outputs.use_tag }}" ]; then
+        if [ ! "$(git tag -l ${{ steps.setup_release_tag.outputs.use_tag }})" ]; then
           git tag ${{ steps.setup_release_tag.outputs.use_tag }}
           git push origin ${{ steps.setup_release_tag.outputs.use_tag }}
         fi
